@@ -2,6 +2,8 @@ using GaussianBasis, Molecules, StaticArrays
 using GaussianBasis: ACSint, num_basis
 using ForwardDiff: ForwardDiff, derivative, gradient, jacobian
 using Enzyme, BenchmarkTools, LinearAlgebra
+import Enzyme.EnzymeRules: forward, reverse, augmented_primal
+using Enzyme.EnzymeRules
 
 function make_hydrogen(rs)
     A = 1.008
@@ -36,8 +38,8 @@ end
 
 hf_energy(P, H, F) = 0.5 * sum(P .* (H + F))
 
-function build_fock(P, S, T, V, ERI)
-    F = T + V
+function build_fock!(F, P, H, ERI)
+    F .= H
     for μ in axes(F, 1)
         for ν in axes(F, 2)
             for λ in axes(P, 1)
@@ -47,43 +49,104 @@ function build_fock(P, S, T, V, ERI)
             end
         end
     end
-    return F
+end
+
+function self_consistent(P, H, S, O, ERI)
+    F = build_fock(P, H, ERI)
+    _, C = eigen(F, S)
+    P - C * O * C'
+end
+
+function rhf_solve(H, S, O, ERI)
+    E_prev = Inf
+    E = 0.0
+    P = zeros(eltype(S), size(S))
+    C = zeros(eltype(S), size(S))
+    F = zeros(eltype(S), size(S))
+    while abs(E - E_prev) > 1e-5
+        E_prev = E
+        build_fock!(F, P, H, ERI)
+        _, C = eigen(F, S)
+        P .= C * O * C'
+        E = hf_energy(P, H, F)
+    end
+    E
+end
+
+function rhf_init(molecule, basisset)
+    N = molecule.Nα + molecule.Nβ
+    S = Symmetric(overlap(basisset))
+    T = kinetic(basisset)
+    V = nuclear(basisset)
+    H = Symmetric(T + V)
+    ERI = ERI_2e4c(basisset)
+    O = Diagonal([i <= N / 2 ? 2.0 : 0.0 for i in 1:size(S, 1)])
+    return H, S, O, ERI
 end
 
 function rhf(molecule, basisset)
-    N = molecule.Nα + molecule.Nβ
-    S = overlap(basisset)
-    T = kinetic(basisset)
-    V = nuclear(basisset)
-    ERI = ERI_2e4c(basisset)
+    H, S, O, ERI = rhf_init(molecule, basisset)
+    Eelec = rhf_solve(H, S, O, ERI)
     Vnuc = Molecules.nuclear_repulsion(molecule.atoms)
-    # Initialize
-    X = S^(-1 / 2)
-    H = T + V
-    P = zeros(eltype(S), size(S))
-    M = diagm([i <= N / 2 ? 2.0 : 0.0 for i in 1:size(S, 1)])
-    # HF loop
-    E_prev = Inf
-    E = 0.0
-    ε = zeros(eltype(S), size(S, 1))
-    C = zeros(eltype(S), size(S))
-    while abs(E - E_prev) > 1e-5
-        E_prev = E
-        F = build_fock(P, S, T, V, ERI)
-        Ft = Symmetric(X' * F * X)
-        ε, Ct = eigen(Ft, sortby=identity)
-        C = X * Ct
-        P = C * M * C'
-        E = hf_energy(P, H, F) + Vnuc
-    end
-    return E, ε, P, C
+    Eelec + Vnuc
 end
 
 # Calculate H2 energy with bond length 1.0 Angstrom
 rs = [0.0 0.0; 0.0 0.0; 0.0 1.0]
 H2 = make_hydrogen(rs)
 basis = make_hydrogen_basis(H2)
-E, ε, P, C = rhf(H2, basis)
+E = rhf(H2, basis)
+H, S, O, ERI = rhf_init(H2, basis)
+rhf_solve(H, S, O, ERI)
+
+function rhf_solve2(H, S, O, ERI, P, C, F)
+    d, U = eigen(S)
+    X = U * Diagonal(1. ./ sqrt.(d))
+    E_prev = Inf
+    E = 0.0
+    while abs(E - E_prev) > 1e-5
+        E_prev = E
+        build_fock!(F, P, H, ERI)
+        Ft = Symmetric(X' * F * X)
+        _, Ct = eigen(Ft)
+        C .= X * Ct
+        P .= C * O * C'
+        E = hf_energy(P, H, F)
+    end
+    E
+end
+
+function augmented_primal(config::RevConfigWidth{1}, func::Const{typeof(rhf_solve2)}, ::Type{<:Active},
+    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated)
+    println("In custom augmented primal rule.")
+    # Compute primal
+    primal = rhf_solve2(H.val, S.val, O.val, ERI.val, P.val, C.val, F.val)
+    return AugmentedReturn(primal, nothing, nothing)
+end
+
+function reverse(config::RevConfigWidth{1}, func::Const{typeof(rhf_solve2)}, dret::Active, tape,
+    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated)
+    println("In custom reverse rule.")
+    autodiff(Reverse, hf_energy, Active, P, H, F)
+    autodiff(Reverse, build_fock!, Const, F, P, H, ERI)
+    return (nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+end
+
+dH = Symmetric(zeros(size(H)))
+dS = Symmetric(zeros(size(S)))
+dERI = zeros(size(ERI))
+P = zeros(eltype(S), size(S))
+C = zeros(eltype(S), size(S))
+F = zeros(eltype(S), size(S))
+dP = zeros(eltype(S), size(S))
+dC = zeros(eltype(S), size(S))
+dF = zeros(eltype(S), size(S))
+rhf_solve2(H, S, O, ERI, P, C, F)
+@code_warntype rhf_solve2(H, S, O, ERI, P, C, F)
+autodiff(ReverseWithPrimal, rhf_solve2, Active, Duplicated(H, dH), Duplicated(S, dS), Const(O), Duplicated(ERI, dERI),
+    Duplicated(P, dP), Duplicated(C, dC), Duplicated(F, dF))
+dH, dP, dF
+
 δ = [0.0 0.0; 0.0 0.0; 0.0 1e-5]
 H2_ = make_hydrogen(rs + δ)
 basis_ = make_hydrogen_basis(H2_)
