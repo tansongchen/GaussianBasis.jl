@@ -1,7 +1,10 @@
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
 Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 GaussianBasis = "9bb1a3dc-0d1c-467e-84f5-0c4ef701360a"
+LinearSolve = "7ed4a6bd-45f5-4d41-b270-4a48e9bafcae"
 Molecules = "5de6a177-b489-40a9-b2f4-524242b9b679"
+SciMLOperators = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"

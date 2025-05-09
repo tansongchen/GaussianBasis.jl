@@ -1,9 +1,32 @@
 using GaussianBasis, Molecules, StaticArrays
 using GaussianBasis: ACSint, num_basis
-using ForwardDiff: ForwardDiff, derivative, gradient, jacobian
+using ForwardDiff
 using Enzyme, BenchmarkTools, LinearAlgebra
 import Enzyme.EnzymeRules: forward, reverse, augmented_primal
 using Enzyme.EnzymeRules
+import CommonSolve: init, solve!
+
+abstract type MeanFieldAlgorithm end
+struct RHF <: MeanFieldAlgorithm end
+struct RHFCache{Mtype,Btype,Htype,Stype,Otype,ERItype,Ftype,Ptype,Ctype,εtype}
+    molecule::Mtype
+    basisset::Btype
+    H::Htype
+    S::Stype
+    O::Otype
+    ERI::ERItype
+    # cache
+    F::Ftype
+    P::Ptype
+    C::Ctype
+    ε::εtype
+end
+
+struct RHFSolution{Etype,Ctype,εtype}
+    E::Etype
+    C::Ctype
+    ε::εtype
+end
 
 function make_hydrogen(rs)
     A = 1.008
@@ -51,29 +74,7 @@ function build_fock!(F, P, H, ERI)
     end
 end
 
-function self_consistent(P, H, S, O, ERI)
-    F = build_fock(P, H, ERI)
-    _, C = eigen(F, S)
-    P - C * O * C'
-end
-
-function rhf_solve(H, S, O, ERI)
-    E_prev = Inf
-    E = 0.0
-    P = zeros(eltype(S), size(S))
-    C = zeros(eltype(S), size(S))
-    F = zeros(eltype(S), size(S))
-    while abs(E - E_prev) > 1e-5
-        E_prev = E
-        build_fock!(F, P, H, ERI)
-        _, C = eigen(F, S)
-        P .= C * O * C'
-        E = hf_energy(P, H, F)
-    end
-    E
-end
-
-function rhf_init(molecule, basisset)
+function init(molecule, basisset, ::RHF)
     N = molecule.Nα + molecule.Nβ
     S = Symmetric(overlap(basisset))
     T = kinetic(basisset)
@@ -81,70 +82,97 @@ function rhf_init(molecule, basisset)
     H = Symmetric(T + V)
     ERI = ERI_2e4c(basisset)
     O = Diagonal([i <= N / 2 ? 2.0 : 0.0 for i in 1:size(S, 1)])
-    return H, S, O, ERI
+    P = zeros(size(S))
+    C = zeros(size(S))
+    F = zeros(size(S))
+    ε = zeros(size(S, 1))
+    RHFCache(molecule, basisset, H, S, O, ERI, F, P, C, ε)
 end
 
-function rhf(molecule, basisset)
-    H, S, O, ERI = rhf_init(molecule, basisset)
-    Eelec = rhf_solve(H, S, O, ERI)
+function scf_solve!(H, S, O, ERI, P, C, F, ε)
+    E_prev = Inf
+    E = 0.0
+    d, U = eigen(S)
+    X = U * Diagonal(1.0 ./ sqrt.(d))
+    while abs(E - E_prev) > 1e-5
+        E_prev = E
+        build_fock!(F, P, H, ERI)
+        Ft = Symmetric(X' * F * X)
+        et, Ct = eigen(Ft)
+        ε .= et
+        C .= X * Ct
+        P .= C * O * C'
+        E = hf_energy(P, H, F)
+    end
+    return E
+end
+
+function solve!(cache::RHFCache)
+    (; molecule, H, S, O, ERI, P, C, F, ε) = cache
     Vnuc = Molecules.nuclear_repulsion(molecule.atoms)
-    Eelec + Vnuc
+    Eelec = scf_solve!(H, S, O, ERI, P, C, F, ε)
+    energy = Eelec + Vnuc
+    RHFSolution(energy, C, ε)
 end
 
 # Calculate H2 energy with bond length 1.0 Angstrom
 rs = [0.0 0.0; 0.0 0.0; 0.0 1.0]
 H2 = make_hydrogen(rs)
 basis = make_hydrogen_basis(H2)
-E = rhf(H2, basis)
-H, S, O, ERI = rhf_init(H2, basis)
-rhf_solve(H, S, O, ERI)
+cache = init(H2, basis, RHF())
+sol = solve!(cache)
 
-function rhf_solve2(H, S, O, ERI, P, C, F)
-    d, U = eigen(S)
-    X = U * Diagonal(1. ./ sqrt.(d))
-    E_prev = Inf
-    E = 0.0
-    while abs(E - E_prev) > 1e-5
-        E_prev = E
-        build_fock!(F, P, H, ERI)
-        Ft = Symmetric(X' * F * X)
-        _, Ct = eigen(Ft)
-        C .= X * Ct
-        P .= C * O * C'
-        E = hf_energy(P, H, F)
-    end
-    E
+function condition!(f1, f2, C, e, H, S, ERI, O)
+    P = C * O * C'
+    F = zeros(size(H))
+    build_fock!(F, P, H, ERI)
+    f1 .= F * C - S * C * e
+    f2 .= (C' * S * C) - I
 end
 
-function augmented_primal(config::RevConfigWidth{1}, func::Const{typeof(rhf_solve2)}, ::Type{<:Active},
-    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated)
+function vjp(dC_de, df, p, t)
+    (C, e, f1, f2, H, S, ERI, O) = p
+    df1 = reshape(df[1:length(f1)], size(f1))
+    df2 = reshape(df[length(f1)+1:end], size(f2))
+    dC, de = zeros(size(C)), zeros(size(e))
+    autodiff(Reverse, condition!, Const, Duplicated(f1, df1), Duplicated(f2, df2),
+        Duplicated(C, dC), Duplicated(e, de), Const(H), Const(S), Const(ERI), Const(O))
+    dC_de[1:length(dC)] .= dC
+    dC_de[length(dC)+1:end] .= de
+    dC_de
+end
+
+function augmented_primal(::RevConfigWidth{1}, ::Const{typeof(scf_solve!)}, ::Type{<:Active},
+    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated, ε::Duplicated)
     println("In custom augmented primal rule.")
-    # Compute primal
-    primal = rhf_solve2(H.val, S.val, O.val, ERI.val, P.val, C.val, F.val)
-    return AugmentedReturn(primal, nothing, nothing)
+    E = scf_solve!(H.val, S.val, O.val, ERI.val, P.val, C.val, F.val, ε.val)
+    return AugmentedReturn(E, nothing, nothing)
 end
 
-function reverse(config::RevConfigWidth{1}, func::Const{typeof(rhf_solve2)}, dret::Active, tape,
-    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated)
+function reverse(::RevConfigWidth{1}, ::Const{typeof(scf_solve!)}, dret::Active, tape,
+    H::Duplicated, S::Duplicated, O::Const, ERI::Duplicated, P::Duplicated, C::Duplicated, F::Duplicated, ε::Duplicated)
     println("In custom reverse rule.")
     autodiff(Reverse, hf_energy, Active, P, H, F)
     autodiff(Reverse, build_fock!, Const, F, P, H, ERI)
-    return (nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    # transfer P to C
+    proto = zeros(length(C.val) + length(ε.val))
+    f1 = zeros(size(C.val))
+    f2 = zeros(size(C.val))
+    op = FunctionOperator(vjp, proto; p = (C, ε, f1, f2, H, S, ERI, O))
+    b = [vec(C.dval); vec(ε.dval)]
+    prob = LinearProblem(op, b)
+    sol = solve(prob)
+    df1 = sol[1:length(C.val)]
+    df2 = sol[length(C.val)+1:end]
+    autodiff(Reverse, condition!, Const, Duplicated(f1, df1), Duplicated(f2, df2),
+        Const(C.val), Const(ε.val), H, S, ERI, O)
+    return (nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
 end
 
-dH = Symmetric(zeros(size(H)))
-dS = Symmetric(zeros(size(S)))
-dERI = zeros(size(ERI))
-P = zeros(eltype(S), size(S))
-C = zeros(eltype(S), size(S))
-F = zeros(eltype(S), size(S))
-dP = zeros(eltype(S), size(S))
-dC = zeros(eltype(S), size(S))
-dF = zeros(eltype(S), size(S))
-rhf_solve2(H, S, O, ERI, P, C, F)
-@code_warntype rhf_solve2(H, S, O, ERI, P, C, F)
-autodiff(ReverseWithPrimal, rhf_solve2, Active, Duplicated(H, dH), Duplicated(S, dS), Const(O), Duplicated(ERI, dERI),
-    Duplicated(P, dP), Duplicated(C, dC), Duplicated(F, dF))
+(; H, S, O, ERI, P, C, F, ε) = init(H2, basis, RHF())
+dH, dS, dERI, dP, dC, dF, dε = Symmetric(zeros(size(H))), Symmetric(zeros(size(S))), zeros(size(ERI)), zeros(size(P)), zeros(size(C)), zeros(size(F)), zeros(size(ε))
+autodiff(ReverseWithPrimal, scf_solve!, Active, Duplicated(H, dH), Duplicated(S, dS), Const(O), Duplicated(ERI, dERI),
+    Duplicated(P, dP), Duplicated(C, dC), Duplicated(F, dF), Duplicated(ε, dε))
 dH, dP, dF
 
 δ = [0.0 0.0; 0.0 0.0; 0.0 1e-5]
