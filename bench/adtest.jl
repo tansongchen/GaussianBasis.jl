@@ -76,10 +76,10 @@ end
 
 function init(molecule, basisset, ::RHF)
     N = molecule.Nα + molecule.Nβ
-    S = Symmetric(overlap(basisset))
+    S = overlap(basisset)
     T = kinetic(basisset)
     V = nuclear(basisset)
-    H = Symmetric(T + V)
+    H = T + V
     ERI = ERI_2e4c(basisset)
     O = Diagonal([i <= N / 2 ? 2.0 : 0.0 for i in 1:size(S, 1)])
     P = zeros(size(S))
@@ -92,7 +92,7 @@ end
 function scf_solve!(H, S, O, ERI, P, C, F, ε)
     E_prev = Inf
     E = 0.0
-    d, U = eigen(S)
+    d, U = eigen(Symmetric(S))
     X = U * Diagonal(1.0 ./ sqrt.(d))
     while abs(E - E_prev) > 1e-5
         E_prev = E
@@ -123,11 +123,13 @@ cache = init(H2, basis, RHF())
 sol = solve!(cache)
 
 function condition!(f1, f2, C, e, H, S, ERI, O)
-    P = C * O * C'
+    P1 = C * O
+    P = P1 * C'
     F = zeros(size(H))
     build_fock!(F, P, H, ERI)
-    f1 .= F * C - S * C * e
-    f2 .= (C' * S * C) - I
+    Z = S * C
+    f1 .= F * C - Z * e
+    f2 .= C' * Z - I
 end
 
 function vjp(dC_de, df, p, t)
@@ -137,8 +139,8 @@ function vjp(dC_de, df, p, t)
     dC, de = zeros(size(C)), zeros(size(e))
     autodiff(Reverse, condition!, Const, Duplicated(f1, df1), Duplicated(f2, df2),
         Duplicated(C, dC), Duplicated(e, de), Const(H), Const(S), Const(ERI), Const(O))
-    dC_de[1:length(dC)] .= dC
-    dC_de[length(dC)+1:end] .= de
+    dC_de[1:length(dC)] .= reshape(dC, length(dC))
+    dC_de[length(dC)+1:end] .= reshape(de, length(de))
     dC_de
 end
 
@@ -155,25 +157,40 @@ function reverse(::RevConfigWidth{1}, ::Const{typeof(scf_solve!)}, dret::Active,
     autodiff(Reverse, hf_energy, Active, P, H, F)
     autodiff(Reverse, build_fock!, Const, F, P, H, ERI)
     # transfer P to C
-    proto = zeros(length(C.val) + length(ε.val))
+    proto = zeros(length(C.val) * 2)
     f1 = zeros(size(C.val))
     f2 = zeros(size(C.val))
-    op = FunctionOperator(vjp, proto; p = (C, ε, f1, f2, H, S, ERI, O))
-    b = [vec(C.dval); vec(ε.dval)]
+    e = diagm(ε.val)
+    op = FunctionOperator(vjp, proto; p = (C.val, e, f1, f2, H.val, S.val, ERI.val, O.val))
+    b = [vec(C.dval); vec(diagm(ε.dval))]
     prob = LinearProblem(op, b)
     sol = solve(prob)
-    df1 = sol[1:length(C.val)]
-    df2 = sol[length(C.val)+1:end]
+    df1 = reshape(sol.u[1:length(C.val)], size(f1))
+    df2 = reshape(sol.u[length(C.val)+1:end], size(f2))
     autodiff(Reverse, condition!, Const, Duplicated(f1, df1), Duplicated(f2, df2),
-        Const(C.val), Const(ε.val), H, S, ERI, O)
+        Const(C.val), Const(e), H, S, ERI, O)
     return (nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
 end
 
-(; H, S, O, ERI, P, C, F, ε) = init(H2, basis, RHF())
-dH, dS, dERI, dP, dC, dF, dε = Symmetric(zeros(size(H))), Symmetric(zeros(size(S))), zeros(size(ERI)), zeros(size(P)), zeros(size(C)), zeros(size(F)), zeros(size(ε))
-autodiff(ReverseWithPrimal, scf_solve!, Active, Duplicated(H, dH), Duplicated(S, dS), Const(O), Duplicated(ERI, dERI),
-    Duplicated(P, dP), Duplicated(C, dC), Duplicated(F, dF), Duplicated(ε, dε))
-dH, dP, dF
+function test_scf_ad()
+    (; H, S, O, ERI, P, C, F, ε) = init(H2, basis, RHF())
+    dH, dS, dERI, dP, dC, dF, dε = zeros(size(H)), zeros(size(S)), zeros(size(ERI)), zeros(size(P)), zeros(size(C)), zeros(size(F)), zeros(size(ε))
+    autodiff(ReverseWithPrimal, scf_solve!, Active, Duplicated(H, dH), Duplicated(S, dS), Const(O), Duplicated(ERI, dERI),
+        Duplicated(P, dP), Duplicated(C, dC), Duplicated(F, dF), Duplicated(ε, dε))
+    dH, dP, dF
+end
+
+function energy_of_r(rs)
+    H2 = make_hydrogen(rs)
+    basis = make_hydrogen_basis(H2)
+    cache = init(H2, basis, RHF())
+    sol = solve!(cache)
+    return sol.E
+end
+
+energy = energy_of_r(rs)
+drs = [0.0 0.0; 0.0 0.0; 0.0 0.0]
+autodiff(Reverse, energy_of_r, Active, Duplicated(rs, drs))
 
 δ = [0.0 0.0; 0.0 0.0; 0.0 1e-5]
 H2_ = make_hydrogen(rs + δ)
